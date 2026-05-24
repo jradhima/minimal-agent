@@ -78,6 +78,66 @@ def write_tool_func(filepath: str, content: str) -> str:
         return f"Error writing file: {str(e)}"
 
 
+def edit_tool_func(filepath: str, old_text: str, new_text: str) -> str:
+    """Edits an existing file by replacing a specific block of text.
+
+    Use this to modify specific sections of a file without rewriting the whole thing.
+    Returns a success message with the filepath, or an error message if it fails.
+    """
+    try:
+        path = Path(filepath)
+
+        if not path.exists():
+            return f"Error: The file '{filepath}' does not exist. Use write_tool to create it."
+        if path.is_dir():
+            return f"Error: '{filepath}' is a directory, not a file."
+
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+        if old_text not in content:
+            return (
+                f"Error: Could not find the exact text block to replace in '{filepath}'. "
+                "Ensure your 'old_text' matches the file content exactly, including spacing and indentation."
+            )
+
+        updated_content = content.replace(old_text, new_text)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(updated_content)
+
+        return f"Successfully updated '{filepath}'."
+
+    except PermissionError:
+        return f"Error: Permission denied. Cannot modify '{filepath}'."
+    except Exception as e:
+        return f"Error editing file: {str(e)}"
+
+
+edit_tool_decl = types.FunctionDeclaration(
+    name="edit_tool_func",
+    description="Edits a file by replacing a specific, unique block of existing text with new text.",
+    parameters_json_schema={
+        "type": "object",
+        "properties": {
+            "filepath": {
+                "type": "string",
+                "description": "The path of the file you want to edit.",
+            },
+            "old_text": {
+                "type": "string",
+                "description": "The exact block of text currently in the file that you want to replace. Must match spacing and indentation perfectly.",
+            },
+            "new_text": {
+                "type": "string",
+                "description": "The new text block that will replace the old_text.",
+            },
+        },
+        "required": ["filepath", "old_text", "new_text"],
+    },
+)
+
+
 read_tool_decl = types.FunctionDeclaration(
     name="read_tool_func",
     description="Reads and returns the complete text contents of a specific file. Returns an explicit error message if the file doesn't exist, is empty, or is a directory.",
@@ -128,12 +188,18 @@ write_tool_decl = types.FunctionDeclaration(
 )
 
 agent_tools = types.Tool(
-    function_declarations=[read_tool_decl, list_tool_decl, write_tool_decl]
+    function_declarations=[
+        read_tool_decl,
+        list_tool_decl,
+        write_tool_decl,
+        edit_tool_decl,
+    ]
 )
 tool_map = {
     "read_tool_func": read_tool_func,
     "list_tool_func": list_tool_func,
     "write_tool_func": write_tool_func,
+    "edit_tool_func": edit_tool_func,
 }
 
 
