@@ -228,7 +228,7 @@ Well, not really. Just running the code again will not do anything. There is not
 
 The clear solution is to declare these tools to the agent, let him know of their existence. It may sound crazy but it's true,  this is how tool calling actually works! You just tell the agent about the possible tools the LLM can use. You have to be very specific about them but the good thing is that LLMs are very good at reading and "understanding" code. So basically, the start of the conversation will look *something* like this:
 * You: Hey, can you tell me what this repo does?
-* Attatched info: Available tools: [`list_tool`, `read_tool`, ...], you can call them this way, ...
+* Attatched info: Available tools: [`list_tool_func`, `read_tool_func`, ...], you can call them this way, ...
 
 ### Registering the tools
 Let's see how you register the tools. We will first do it the *manual* way. We must write some function declarations which are basically the user manual of the tools in a JSON format.
@@ -274,6 +274,29 @@ response = client.models.generate_content(
 )
 ```
 Let's try and see if it's going to work!
+```
+>> uv run iterations/tool-declarations-only.py
+Chat with Gemini (type ctrl-c to quit)
+
+You: Can you tell me how many files are in this repo?
+Warning: there are non-text parts in the response: ['function_call'], returning concatenated text result from text parts. Check the full candidates.content.parts accessor to get the full model response.
+Agent: (Thinking... or tried to call a tool that wasn't executed)
+Raw response: [Part(
+  function_call=FunctionCall(
+    args={
+      'directory_path': '.'
+    },
+    id='aWXnr3fm',
+    name='list_tool_func'
+  ),
+  thought_signature=b'\x124\n2\x01\x0c9\xd6\xc7\xee\xd4\xb2\xefC\xea(\xa8T=T\xd7AsP7gXj\n\xd7E\xf4\x83\xdc\xa7\xfe\xd6\xd5|\x8ckw\x84\xe0\x8f\xde<\xe5g\xd3\x16\xee\xbcj'
+)]
+
+You:
+```
+The model tried to do something! We asked it to count files and it (correctly) started by trying to see how many there are. LLMs are nowdays post trained using reinforcement learning on these types of conversations/patterns A LOT, so they naturally know what tools are and how to call them. You don't need to explain much or write a prompt explaining how to, they just know.
+
+We are now in a good spot, what's left is helping the LLM actually use the tools. An LLM can only tell us what it wants to do, it's up to us to give it "hands" with which to use the tools.
 
 ## Part 3: Giving the Agent "Hands" (Tool Execution)
 * The logic behind `resolve_tool_calls`.
