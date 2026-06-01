@@ -1,5 +1,7 @@
 # Building a Minimal AI Agent
 
+> The code in this article can be found in [this repo](https://github.com/jradhima/minimal-agent)
+
 ## Introduction
 If you're a dev of any type and you're not living under a rock in 2026, you've surely used or at least heard about AI agents. I will only mention my dislike for the use of "AI" because I don't believe the "I" part but let's continue.
 
