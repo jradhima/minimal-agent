@@ -268,9 +268,9 @@ agent_tools = types.Tool(function_declarations=[read_tool_decl, list_tool_decl])
 Having defined the declarations, we must pass them to the agent with the request. We do this by modifying the request code as such:
 ```python
 response = client.models.generate_content(
-            model=MODEL,
-            contents=conversation,
-            config=types.GenerateContentConfig(tools=[agent_tools])
+    model=MODEL,
+    contents=conversation,
+    config=types.GenerateContentConfig(tools=[agent_tools])
 )
 ```
 Let's try and see if it's going to work!
@@ -296,18 +296,191 @@ You:
 ```
 The model tried to do something! We asked it to count files and it (correctly) started by trying to see how many there are. LLMs are nowdays post trained using reinforcement learning on these types of conversations/patterns A LOT, so they naturally know what tools are and how to call them. You don't need to explain much or write a prompt explaining how to, they just know.
 
-We are now in a good spot, what's left is helping the LLM actually use the tools. An LLM can only tell us what it wants to do, it's up to us to give it "hands" with which to use the tools.
+We are now in a good spot, what's left is helping the LLM actually use the tools. An LLM can only tell us what it wants to do, it's up to us to give it "hands" with which to use the tools. The LLM "throws" and we must implement the "caching" part.
 
 ## Part 3: Giving the Agent "Hands" (Tool Execution)
-* The logic behind `resolve_tool_calls`.
-* Mapping JSON function calls from the model back to Python functions.
-* The "Parallel Execution" rule: Handling multiple tool requests efficiently.
+
+### Function calls
+In the logs shown above, we can see a `FunctionCall` object. This is part of the response the model returns. When we declare tools in our request, the LLM may respond with a normal response or it may respond with a response *plus* function calls that it wants us to resolve. Basically, the LLM might say something like:
+
+>In order to tell you how many files exist in the repo, i first need to look there myself. I see that there is a `list_tool` available and it returns a list of filepaths which is exactly what I need. The user asked for the current repo which means i should ask for path `.`
+
+It will then format its response in such a way that the library we use can intercept the response and serialize it in a structured way. Part of this will be the model response while part of it will be the requested function calls. To fetch these we can just reach for them:
+```python
+response = client.models.generate_content(
+    model=MODEL,
+    contents=conversation,
+    config=types.GenerateContentConfig(tools=[agent_tools]),
+)
+
+print(response.function_calls)
+```
+This data structure contains a list of everything we need. Function names and arguments. There is 1 minor problem, we need to write down a way to go from strings to function calls. The simplest way to do this would be something like:
+```python
+for call in response.function_calls:
+    if call.name == "list_tool_func":
+        result = list_tool_func(**call.args)
+    elif call.name == "read_tool_func":
+        result = read_tool_func(**call.args)
+    else:
+        result = f"Error: Tool '{call.name}' is not recognized."
+```
+In a more modern take, it could look like this but it's still not super nice:
+```python
+for call in response.function_calls:
+    match call.name:
+        case "list_tool_func":
+            result = list_tool_func(**call.args)
+        case "read_tool_func":
+            result = read_tool_func(**call.args)
+        case _:
+            result = f"Error: Tool '{call.name}' is not recognized."
+```
+A better pattern is something like this:
+```python
+tool_map = {
+    "read_tool_func": read_tool_func,
+    "list_tool_func": list_tool_func,
+}
+
+for call in response.function_calls:
+    if func := tool_map.get(call.name, None):
+        result = func(**call.args)
+    else:
+        result = f"Error: Tool '{call.name}' is not recognized."
+```
+So now we get a better idea of the process. We must have predefined the *plumbing* to get text wired to the correct functions to execute. Without this trick, the LLM responds with text but this leaves us with an ugly looking chat or, at best, with the agent guiding us how to be agents ourselves (if we assume we follow its instructions to achieve our goal)!
+
+### Giving control to the agent
+One important thing to note is that a tools flow is different to a chat flow in an important way; when responding in a chat, the LLM will give control back to us because it has been trained to generate tokens until it reaches the end of what it has to say (actually, until the token for "terminate discussion" is the best candidate for next token to use). So a conversation is incremented by 1 party at a time, once us, then the model, then us, then the model...
+
+However with tools, the proper flow is different; the model gets to choose when it gives control back to us. We ask something, the model "thinks" and at face value, the process is the same. It terminates with the agent sending its response. However this response assumes that we will run the function calls and send back the results so the LLM can resume working. We could choose to not do this. We could route the function call results to us, write our response, then send a new request. This is suboptimal. The agent should be able to run independently until it thinks it has a response. This means that we trust it to enter a tool calling loop until it's ready. This looks something like this:
+```python
+self.conversation.append(self.get_user_response())
+response = self.get_model_response()
+
+while True:
+    if response.candidates:
+        self.conversation.append(response.candidates[0].content)
+
+    if not response.function_calls:
+        break
+
+    tool_content = self.resolve_tool_calls(response)
+    self.conversation.append(tool_content)
+    response = self.get_model_response()
+
+if response.candidates and response.text:
+    print("Agent: ", response.text)
+```
+We can add guardrails here, like a maximum number of tool calls. It's up to us, however for the agent to be most effective it must be able to work independently.
 
 ## Part 4: Putting It All Together
-* Walking through the full `main.py` flow.
-* How the `Agent` class coordinates the chat loop and the tool loop.
-* Running the agent for the first time.
+We've covered the theory, the tools, and the plumbing. Now it's time to assemble everything into a working agent. If you look at `main.py` in the linked repo, there is an `Agent` class that handles the lifecycle of a request, from user input to the final response. There are also 2 more tools, `edit_tool` and `write_tool`, just to make things more interesting.
+
+### The Agent Class
+The `Agent` class is the orchestrator. Its main job is to maintain the conversation state and handle the "handshaking" with the Gemini model.
+
+```python
+class Agent:
+    def __init__(self, client: genai.Client):
+        self.client = client
+        self.conversation = list()
+```
+
+By keeping `self.conversation` as a list, we maintain the full history of the interaction—including the back-and-forth between the user, the model, and the tool results.
+
+### The Coordination Loop
+The heart of the agent is the `run()` method, which handles the flow when an agent decides to use tools.
+
+```python
+def run(self):
+    # ...
+    while True:
+        self.conversation.append(self.get_user_response())
+        response = self.get_model_response()
+
+        # The inner loop: tool calling
+        while True:
+            if response.candidates:
+                self.conversation.append(response.candidates[0].content)
+
+            if not response.function_calls:
+                break
+
+            tool_content = self.resolve_tool_calls(response)
+            self.conversation.append(tool_content)
+            response = self.get_model_response()
+```
+
+The nested `while True` loop is exactly what we were talking about in the previous section: the agent might need to call a tool, wait for the result, think, and call *another* tool. It might repeat this cycle several times before it finally has enough information to give its final answer.
+
+### Parallel Execution
+One of the most important pieces for the understanding of how agents work is the instruction we give the model in the `system_instruction`:
+
+> "CRITICAL EFFICIENCY RULE: Whenever you discover multiple files that need to be read or inspected or written, you MUST execute all function calls in PARALLEL within a single turn."
+
+Because we structured our `Agent` to handle multiple function calls in `resolve_tool_calls`, the agent can indeed run operations in parallel. This is a massive performance boost when scanning an entire directory or reading multiple related files.
+
+I added this specific efficiency rule after consulting with Gemini about why my agent would not perform parallel calls! I would ask it to tell me about the files in the repo, then the agent would list read them 1 at a time even though it knows that it can send multiple function calls in 1 response! Sometimes you have to resort to tricks like these to make agents listen and follow instructions. A lot of this has to do with how providers perform post-training but not all models are equally good at following instructions or using tools. General LLM "intelligence" is one thing, agentinc workflow performance is a different topic.
+
+### Running the Agent
+Now that the tools (`list`, `read`, `write`, `edit`) are fully registered and the `Agent` is orchestrating the flow, go ahead and run it:
+
+```bash
+uv run main.py
+```
+
+You can now ask the agent questions like: *"List the files in this directory"* or *"Read main.py and tell me how the Agent class works"*. You will see the agent "thinking," identifying the correct tool, executing it, and integrating the results into its reasoning—all without you lifting a finger.
+
+## Part 5: Using the SDK fully
+We've done everything but the code seems a bit lengthy, filled with boilerplate and lines of code that are really not interesting at all! Thankfully all of this was intentional to make the agent as explicit as possible.
+
+In the linked repo, `iterations/05-final-agent.py` demonstrates how to achieve the same functionality in under 150 lines. 
+
+### Automatic Tool Registration
+Instead of manually defining `types.FunctionDeclaration` for every tool, the SDK can reflect on Python functions directly. If you provide a function with a well-formatted docstring, the SDK handles the conversion for you:
+
+```python
+# The SDK automatically extracts the schema from the function and docstring
+chat = client.chats.create(
+    model=MODEL,
+    config=types.GenerateContentConfig(
+        tools=[list_tool_func, read_tool_func, write_tool_func, edit_tool_func]
+    )
+)
+```
+
+### Automatic Tool Resolution
+The `chat` object is actually "tool-aware." When you call `chat.send_message()`, it can automatically execute the functions requested by the model and return the final text result, effectively collapsing your entire `while` loop into a single function call.
+
+Actually, the tool-awareness is part of the SDK and is enabled by default if we pass the functions to the request directly. This part comes straight from the docs:
+```python
+from google.genai import types
+
+def get_current_weather(location: str) -> str:
+    """Returns the current weather.
+
+    Args:
+        location: The city and state, e.g. San Francisco, CA
+    """
+    return 'sunny'
+
+
+response = client.models.generate_content(
+    model='gemini-2.5-flash',
+    contents='What is the weather like in Boston?',
+    config=types.GenerateContentConfig(
+        tools=[get_current_weather],
+    ),
+)
+
+print(response.text)
+```
+We had to implement it because we were doing things "the hard way" (nothing hard about it, just boring!) but generally these things are taken care off. That said, using the manual way allowed us to learn more, to debug specific agent behaviors and to implement non-standard control (like injecting specialized logging). There may be ways to do these things using the SDK as well but in general, this is the standard compromise when using 3rd party code and higher level abstractions.
+
 
 ## Conclusion
-* Recap of what was built.
-* Where to go from here: Adding memory, search capabilities, or web browsing.
+Next steps? Actual coding agents implement memory to handle conversation serialization so the agent doesnt't "forget" (could be simply a directory with JSON files, Opencode used this for a *long* time until they switched to sqlite), web search, a bash tool, subagents. What about security? This agent could overwrite all our files and if it had a bash tool could just `rm -rf /` our computer to oblibion! A hot topic is sandboxing and how to make sure the agent can work freely without the user having to babysit every tool call (coding agents can ask for user permission on tool calls).
+
+The choices are limitless but in many ways they are not really! We started with a basic API request and finished with a functional agent capable of basic interactions with the file system. An agent that doesn't just talk, but acts. This project was meant to show that building an "AI Agent" isn't magic at all. In the end, it's just plumbing, loops and a good LLM.
